@@ -13,8 +13,8 @@
 // #include <png.h>
 
 
-#include <cuda.h>
-#include <cuda_runtime.h>
+// #include <cuda.h>
+// #include <cuda_runtime.h>
 
 using namespace std;
 
@@ -104,6 +104,7 @@ static void draw_png() {
 void* thread_target(void* arg) {
     int* start = (int*) arg;
     double t =  double(start[0]);
+    double local_t_end = t + 1.0;
     
     // Setup the vertex array
     vector<Vertex> vertex_array(iters * steps_per_frame); // 800 * 500
@@ -111,7 +112,7 @@ void* thread_target(void* arg) {
         vertex_array[i].color = GetRandColor(i % iters);
 
 
-    for (; t < t+1.0; )
+    for (; t < local_t_end; )
     {
         for (int step = 0; step < steps_per_frame; ++step) //steps = 500
         {
@@ -155,6 +156,8 @@ void* thread_target(void* arg) {
 
     } // t end
 
+    pthread_exit(NULL);
+
 }
 
 int main(int argc, char* argv[]) {
@@ -172,7 +175,7 @@ int main(int argc, char* argv[]) {
 
     for (int i = 0; i < num_threads; ++i)
     {
-        assert (0 == pthread_create(&threads[i], NULL, thread_target, (void*) &start_point[i]);
+        assert (0 == pthread_create(&threads[i], NULL, thread_target, (void*) &start_point[i]));
     }
         
 

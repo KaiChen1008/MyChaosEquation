@@ -185,7 +185,7 @@ int main(int argc, char* argv[]) {
             } //iteration end
 
 			// t += (isOffScreen) ? 1e-10 : rolling_delta;
-			t += 1e-8;
+			t += 1e-7;
         } // step end
 
 		// Draw the data
