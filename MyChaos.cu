@@ -107,6 +107,8 @@ void* thread_target(void* arg) {
     
     // Setup the vertex array
     vector<Vertex> vertex_array(iters * steps_per_frame); // 800 * 500
+    for (size_t i = 0; i < vertex_array.size(); ++i) 
+        vertex_array[i].color = GetRandColor(i % iters);
 
 
     for (; t < t+1.0; )
@@ -160,8 +162,6 @@ int main(int argc, char* argv[]) {
 	cout << "start computing........." << endl;
 	start = clock();
 
-    for (size_t i = 0; i < vertex_array.size(); ++i) 
-        vertex_array[i].color = GetRandColor(i % iters);
 
     // Initialize random parameters
     ResetPlot();
