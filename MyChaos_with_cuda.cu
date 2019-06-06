@@ -13,11 +13,14 @@
 #include <png.h>
 #include "tbb/concurrent_queue.h"
 #include <chrono> 
-// #include <cuda.h>
-// #include <cuda_runtime.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
 
 using namespace std;
 using namespace tbb;
+
+#define BLOCKS_PER_GRID 32
+#define THREADS_PER_BLOCK 32
 
 clock_t start, stop;
 //Global constants
@@ -74,13 +77,30 @@ struct Vertex{
     Color  color;
 };
 
+struct raw_vector2f{
+    double* xs;
+    double* ys;
+};
+
 struct V{
-    vector<Vertex> vertex_array; // 800 * 500
+    vector<Vertex> vertex_array;
     double t;
 };
 
 // queue<V> vertex_array_queue[6];
 concurrent_queue<V> vertex_array_queue[6];
+
+
+inline void e(cudaError_t err, const char* file, int line)
+{
+    if (err != cudaSuccess) 
+    {
+        printf("Error in %s at line %d:\n\t%s\n", file, line, cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
+    }
+}
+#define HANDLE_ERROR(err) ( e(err, __FILE__, __LINE__) )
+
 
 static Color GetRandColor(int i) {
   i += 1;
@@ -96,11 +116,14 @@ static void ResetPlot() {
   plot_y = 0.0f;
 }
 
-static Vector2f ToScreen(double x, double y) {
-  const float s = plot_scale * float(window_h / 2);
-  const float nx = float(window_w) * 0.5f + (float(x) - plot_x) * s;
-  const float ny = float(window_h) * 0.5f + (float(y) - plot_y) * s;
-  return Vector2f{nx, ny};
+__device__ void ToScreen(Vector2f& screenPt) {
+
+  const float s = 0.25f * 1600.0 / 2.0;
+  const float nx = 1600.0 * 0.5f + (float(screenPt.x) - 0.0) * s;
+  const float ny = 900.0  * 0.5f + (float(screenPt.y) - 0.0) * s;
+  screenPt.x = nx;
+  screenPt.y = ny;
+//   return Vector2f{nx, ny};
 }
 
 static void RandParams(double* params) {
@@ -191,6 +214,51 @@ void create_png(vector<Vertex>& vertex_array, double t) {
 	free(imageB);
 }
 
+__global__ void compute_each_step(Vector2f* cuda_vector_array, double T) {
+    // index
+    int id = threadIdx.x + blockIdx.x * blockDim.x;
+    int stride = blockDim.x * gridDim.x;
+
+
+    for (int step = id ; step < 1000; step = step + stride) //steps = 2000
+    {
+        double t = T + step * 1e-7;
+        // bool isOffScreen = true;
+        double x = t;
+        double y = t;
+        for (int iter = 0; iter < 800; ++iter) // 800
+        {
+            const double xx = x * x; const double yy = y * y; const double tt = t * t;
+            const double xy = x * y; const double xt = x * t; const double yt = y * t;
+
+            const double nx =   xx * 1 + yy * 0 + tt * 0 + 
+                                xy * 0 + xt *-1 + yt * 1 + 
+                                x  *-1 + y  * 0 + t  * 0 ;
+            
+            const double ny =   xx * 0 + yy *-1 + tt *-1 + 
+                                xy *-1 + xt *-1 + yt *-1 + 
+                                x  * 0 + y  *-1 + t  * 0 ;
+            x = nx;
+            y = ny;
+
+            Vector2f screenPt;
+            screenPt.x = x;
+            screenPt.y = y;
+
+            ToScreen(screenPt);
+            if (iter < 100)
+            {
+                screenPt.x = FLT_MAX;
+                screenPt.y = FLT_MAX;
+            }
+
+            cuda_vector_array[step*800 + iter].x = screenPt.x;
+            cuda_vector_array[step*800 + iter].y = screenPt.y;
+
+        } //iteration end
+    } // step end
+}
+
 void* thread_target(void* arg) {
     int* start = (int*) arg;
     int thread_num = int(start[0]);
@@ -202,8 +270,8 @@ void* thread_target(void* arg) {
 
     // Setup the vertex array
     V result;
-    result.vertex_array.resize(iters * steps_per_frame); // 800 * 500
-    // vector<Vertex> vertex_array(iters * steps_per_frame);
+    result.vertex_array.resize(iters * steps_per_frame); // 800 * 2000
+    
     
     for (size_t i = 0; i < result.vertex_array.size(); ++i) 
         result.vertex_array[i].color = GetRandColor(i % iters);
@@ -214,7 +282,6 @@ void* thread_target(void* arg) {
         // wait for i/o 
         if (vertex_array_queue[thread_num + which_io].unsafe_size() >= queue_size)
         {
-
             // cout << "full hits: " << ++full_hits << " ,which io thread: " << thread_num + which_io << endl;
             continue;
         }else 
@@ -222,40 +289,59 @@ void* thread_target(void* arg) {
             full_hits = 0;
         }
 
-        for (int step = 0; step < steps_per_frame; ++step) //steps = 2000
+        // set GPU id
+        if (thread_num == 0)
+            cudaSetDevice(0);
+        else
+            cudaSetDevice(1);
+
+        // GPU memory
+        Vector2f* cuda_vector_array;
+        Vector2f* vector_array = (Vector2f*)malloc(iters * steps_per_frame/2 * sizeof(Vector2f));
+
+        HANDLE_ERROR( cudaMalloc(&cuda_vector_array, iters * steps_per_frame/2 * sizeof(Vector2f)));
+
+        /*********************** first round ***********************/
+        // invoke kernel
+        compute_each_step<<<BLOCKS_PER_GRID, THREADS_PER_BLOCK>>>(cuda_vector_array, t);
+
+        // cathc error from kernel synchronize
+        HANDLE_ERROR( cudaGetLastError());
+        // catch error from kernel asynchronize
+        HANDLE_ERROR( cudaDeviceSynchronize());
+
+        HANDLE_ERROR( cudaMemcpy(&vector_array, cuda_vector_array, iters * steps_per_frame/2 * sizeof(Vector2f), cudaMemcpyDeviceToHost));
+        
+        // copy data back to result.vertex_array
+        for (size_t i = 0; i < result.vertex_array.size() / 2; ++i) 
         {
-			bool isOffScreen = true;
-            double x = t;
-            double y = t;
-            for (int iter = 0; iter < iters; ++iter) // 800
-            {
-                const double xx = x * x; const double yy = y * y; const double tt = t * t;
-                const double xy = x * y; const double xt = x * t; const double yt = y * t;
+            result.vertex_array[i].position.x = vector_array[i].x;
+            result.vertex_array[i].position.y = vector_array[i].y;
+        }
+        t += 1000 * 1e-7;
 
-                const double nx = xx * params[ 0] + yy * params[ 1] + tt * params[ 2] + 
-                            xy * params[ 3] + xt * params[ 4] + yt * params[ 5] + 
-                            x  * params[ 6] + y  * params[ 7] + t  * params[ 8] ;
-                
-                const double ny = xx * params[ 9] + yy * params[10] + tt * params[11] + 
-                            xy * params[12] + xt * params[13] + yt * params[14] + 
-                            x  * params[15] + y  * params[16] + t  * params[17] ;
-                x = nx;
-                y = ny;
+        /*********************** secodn round ***********************/
+        // invoke kernel
+        compute_each_step<<<BLOCKS_PER_GRID, THREADS_PER_BLOCK>>>(cuda_vector_array, t);
 
-				Vector2f screenPt = ToScreen(x,y);
-                if (iter < 100)
-                {
-                    screenPt.x = FLT_MAX;
-                    screenPt.y = FLT_MAX;
-                }
+        // cathc error from kernel synchronize
+        HANDLE_ERROR( cudaGetLastError());
+        // catch error from kernel asynchronize
+        HANDLE_ERROR( cudaDeviceSynchronize());
 
-                result.vertex_array[step*iters + iter].position = screenPt;
+        HANDLE_ERROR( cudaMemcpy(&vector_array, cuda_vector_array, iters * steps_per_frame/2 * sizeof(Vector2f), cudaMemcpyDeviceToHost));
+        
+        // copy data back to result.vertex_array
+        int st = result.vertex_array.size() / 2;
+        for (size_t i = 0; i < result.vertex_array.size() / 2; ++i) 
+        {
+            result.vertex_array[st + i].position.x = vector_array[i].x;
+            result.vertex_array[st + i].position.y = vector_array[i].y;
+        }
+        t += 1000 * 1e-7;
 
-            } //iteration end
-
-			t += t_step;
-        } // step end
-
+        free(vector_array);
+        
 		// Draw the data
         // put the vertex array to queue
         result.t = t;
